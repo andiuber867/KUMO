@@ -1,7 +1,7 @@
 import { cookies } from 'next/headers';
 
 export const SESSION_COOKIE = 'kumo_admin_session';
-export const SESSION_SECONDS = 8 * 60 * 60;
+export const SESSION_SECONDS = 1 * 60 * 60;
 const encoder = new TextEncoder();
 const hex = (bytes: ArrayBuffer) => Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
 
