@@ -66,18 +66,18 @@ export function AdminPanel({username}:{username:string}){
    <h2>Productos <span>{products.length}</span></h2>
    <div className="admin-list-controls">
      <div className="sort-select-wrapper">
-       <SlidersHorizontal size={15} className="sort-icon"/>
+       <SlidersHorizontal size={14} className="sort-icon"/>
        <Select value={sortBy} onValueChange={(val:SortOption)=>setSortBy(val)}>
          <SelectTrigger className="sort-trigger" aria-label="Ordenar productos">
            <SelectValue placeholder="Ordenar por"/>
          </SelectTrigger>
-         <SelectContent>
-           <SelectItem value="recent">Últimos editados/agregados</SelectItem>
-           <SelectItem value="new">✦ Novedades primero</SelectItem>
-           <SelectItem value="available">✓ Disponibles primero</SelectItem>
-           <SelectItem value="name">🔤 Nombre (A-Z)</SelectItem>
-           <SelectItem value="price_asc">🏷️ Precio: Menor a Mayor</SelectItem>
-           <SelectItem value="price_desc">🏷️ Precio: Mayor a Menor</SelectItem>
+         <SelectContent className="sort-popover">
+           <SelectItem value="recent">Últimos editados</SelectItem>
+           <SelectItem value="new">Novedades primero</SelectItem>
+           <SelectItem value="available">Disponibles primero</SelectItem>
+           <SelectItem value="name">Nombre (A-Z)</SelectItem>
+           <SelectItem value="price_asc">Precio: menor a mayor</SelectItem>
+           <SelectItem value="price_desc">Precio: mayor a menor</SelectItem>
          </SelectContent>
        </Select>
      </div>

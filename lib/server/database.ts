@@ -92,32 +92,42 @@ const defaultDishes: ProductRow[] = [
 
 function getDbFilePath(): string {
   if (process.env.DB_PATH) return process.env.DB_PATH;
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return '/tmp/kumo_db.json';
+  }
   try {
     const dataDir = path.join(process.cwd(), '.data');
     if (!fs.existsSync(/*turbopackIgnore: true*/ dataDir)) {
       fs.mkdirSync(/*turbopackIgnore: true*/ dataDir, { recursive: true });
     }
+    const testFile = path.join(dataDir, '.write_test');
+    fs.writeFileSync(/*turbopackIgnore: true*/ testFile, '1');
+    fs.unlinkSync(/*turbopackIgnore: true*/ testFile);
     return path.join(dataDir, 'kumo_db.json');
   } catch {
-    return path.join('/tmp', 'kumo_db.json');
+    return '/tmp/kumo_db.json';
   }
 }
 
 let inMemoryState: DatabaseState | null = null;
 
 function loadState(): DatabaseState {
-  const filePath = getDbFilePath();
-  try {
-    if (fs.existsSync(/*turbopackIgnore: true*/ filePath)) {
-      const content = fs.readFileSync(/*turbopackIgnore: true*/ filePath, 'utf8');
-      const parsed = JSON.parse(content) as DatabaseState;
-      if (parsed && Array.isArray(parsed.products)) {
-        inMemoryState = parsed;
-        return inMemoryState;
+  const primaryPath = getDbFilePath();
+  const pathsToTry = Array.from(new Set([primaryPath, '/tmp/kumo_db.json']));
+
+  for (const filePath of pathsToTry) {
+    try {
+      if (fs.existsSync(/*turbopackIgnore: true*/ filePath)) {
+        const content = fs.readFileSync(/*turbopackIgnore: true*/ filePath, 'utf8');
+        const parsed = JSON.parse(content) as DatabaseState;
+        if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
+          inMemoryState = parsed;
+          return inMemoryState;
+        }
       }
+    } catch {
+      // Continue trying fallback paths
     }
-  } catch (e) {
-    // Read error fallback
   }
 
   if (!inMemoryState) {
@@ -134,15 +144,19 @@ function loadState(): DatabaseState {
 
 function saveState(state: DatabaseState): void {
   inMemoryState = state;
-  try {
-    const filePath = getDbFilePath();
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(/*turbopackIgnore: true*/ dir)) {
-      fs.mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
+  const filePath = getDbFilePath();
+  const pathsToSave = Array.from(new Set([filePath, '/tmp/kumo_db.json']));
+
+  for (const fp of pathsToSave) {
+    try {
+      const dir = path.dirname(fp);
+      if (!fs.existsSync(/*turbopackIgnore: true*/ dir)) {
+        fs.mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
+      }
+      fs.writeFileSync(/*turbopackIgnore: true*/ fp, JSON.stringify(state, null, 2), 'utf8');
+    } catch {
+      // Ignore errors on non-writable paths
     }
-    fs.writeFileSync(/*turbopackIgnore: true*/ filePath, JSON.stringify(state, null, 2), 'utf8');
-  } catch {
-    // Read-only serverless filesystem outside /tmp
   }
 }
 
