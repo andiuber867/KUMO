@@ -194,11 +194,15 @@ function createStatementExecutor(sql: string, args: any[] = []) {
 
       if (trimmed.includes('FROM products')) {
         const sorted = [...state.products].sort((a, b) => {
+          if (trimmed.includes('is_new DESC')) {
+            if (b.is_new !== a.is_new) return b.is_new - a.is_new;
+          }
           if (b.created_at !== a.created_at) return b.created_at - a.created_at;
           return a.name.localeCompare(b.name);
         });
         return { results: sorted as unknown as T[] };
       }
+
 
       return { results: [] };
     },
