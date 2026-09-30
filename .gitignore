@@ -44,4 +44,7 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
-`n!.env.example
+
+!.env.example
+*.tsbuildinfo
+
