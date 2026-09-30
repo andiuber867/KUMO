@@ -1,16 +1,10 @@
-import { readCatalog } from '@/features/products/repository';
-import { MenuExperience } from '@/features/menu/menu-experience';
-import { Product } from '@/features/products/types';
+import { adminIdentity } from '@/lib/server/auth';
+import { AdminPanel } from '@/features/admin/admin-panel';
+import { LoginForm } from '@/features/auth/login-form';
 
 export const dynamic = 'force-dynamic';
 
 export default async function Home() {
-  let initialProducts: Product[] = [];
-  try {
-    const catalog = await readCatalog();
-    initialProducts = catalog.products;
-  } catch (e) {
-    console.error('Failed to load initial catalog:', e);
-  }
-  return <MenuExperience initialProducts={initialProducts} />;
+  const admin = await adminIdentity();
+  return admin ? <AdminPanel username={admin.username} /> : <LoginForm />;
 }
