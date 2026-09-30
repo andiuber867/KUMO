@@ -1,10 +1,10 @@
-import { env } from 'cloudflare:workers';
 import { database } from '@/lib/server/database';
-import { sameOrigin, verifyPassword, tokenHash, sessionCookie, SESSION_SECONDS } from '@/lib/server/auth';
+import { sameOrigin, verifyPassword, tokenHash, sessionCookie, SESSION_SECONDS, getAdminConfig } from '@/lib/server/auth';
 
 export async function POST(request: Request) {
   if (!sameOrigin(request)) return Response.json({error:'Solicitud no permitida.'}, {status:403});
-  if (!env.ADMIN_PASSWORD_HASH || !env.ADMIN_PASSWORD_SALT || !env.ADMIN_USERNAME) return Response.json({error:'El acceso de administración aún no está configurado.'}, {status:503});
+  const config = getAdminConfig();
+  if (!config.ADMIN_PASSWORD_HASH || !config.ADMIN_PASSWORD_SALT || !config.ADMIN_USERNAME) return Response.json({error:'El acceso de administración aún no está configurado.'}, {status:503});
   try {
     const input = await request.json() as {username?:unknown;password?:unknown};
     if (typeof input.username !== 'string' || typeof input.password !== 'string' || input.username.length > 100 || input.password.length > 256) return Response.json({error:'Usuario o contraseña incorrectos.'}, {status:400});
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
       db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(now),
       db.prepare('DELETE FROM login_limits WHERE expires_at <= ?').bind(now),
       db.prepare('DELETE FROM login_limits WHERE key = ?').bind(bucket),
-      db.prepare('INSERT INTO admin_sessions (token_hash, username, credential_version, expires_at) VALUES (?, ?, ?, ?)').bind(await tokenHash(token), env.ADMIN_USERNAME, await tokenHash(env.ADMIN_PASSWORD_HASH), now + SESSION_SECONDS*1000),
+      db.prepare('INSERT INTO admin_sessions (token_hash, username, credential_version, expires_at) VALUES (?, ?, ?, ?)').bind(await tokenHash(token), config.ADMIN_USERNAME, await tokenHash(config.ADMIN_PASSWORD_HASH), now + SESSION_SECONDS*1000),
     ]);
     return Response.json({ok:true}, {headers:{'Set-Cookie':sessionCookie(token,request),'Cache-Control':'no-store'}});
   } catch (error) {
