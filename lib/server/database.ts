@@ -124,11 +124,7 @@ function getRedisClient(): Redis | null {
   if (url && token) {
     return new Redis({ url, token });
   }
-  try {
-    return Redis.fromEnv();
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 // --- Local & Cloud Sync State ---
