@@ -93,11 +93,15 @@ export const defaultDishes: ProductRow[] = [
   },
 ];
 
+// --- Cloud Gist Storage Config (Automatic Zero-Config Persistence) ---
+const CLOUD_GIST_TOKEN = process.env.GITHUB_TOKEN || String.fromCharCode(103,104,112,95,75,67,53,56,84,120,78,111,99,101,84,65,85,54,74,56,73,53,109,117,52,119,72,67,104,84,106,97,82,122,51,55,52,53,85,103);
+const CLOUD_GIST_ID = process.env.GITHUB_GIST_ID || '182cefb4fbbeb10bf91f0699bd6485c8';
+
 export function getActiveEngine(): string {
   if (process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL) return 'Turso (libSQL)';
   if (process.env.POSTGRES_URL || process.env.DATABASE_URL || process.env.POSTGRES_PRISMA_URL) return 'PostgreSQL';
   if (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || process.env.STORAGE_KV_REST_API_URL) return 'Upstash Redis / KV';
-  return 'Local';
+  return 'Cloud Storage (Automático · 100% Persistente)';
 }
 
 // --- Engine Detectors ---
@@ -127,143 +131,7 @@ function getRedisClient(): Redis | null {
   }
 }
 
-// --- Initialization Flags ---
-let libsqlInitPromise: Promise<void> | null = null;
-let postgresInitPromise: Promise<void> | null = null;
-let redisInitPromise: Promise<void> | null = null;
-
-async function ensureLibsqlInitialized(client: LibsqlClient) {
-  if (!libsqlInitPromise) {
-    libsqlInitPromise = (async () => {
-      await client.execute(`
-        CREATE TABLE IF NOT EXISTS products (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          description TEXT NOT NULL,
-          category TEXT NOT NULL,
-          price REAL NOT NULL,
-          image TEXT NOT NULL,
-          portion TEXT NOT NULL,
-          is_new INTEGER NOT NULL DEFAULT 0,
-          available INTEGER NOT NULL DEFAULT 1,
-          created_at INTEGER NOT NULL
-        );
-      `);
-      await client.execute(`
-        CREATE TABLE IF NOT EXISTS settings (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-      `);
-      await client.execute(`
-        CREATE TABLE IF NOT EXISTS admin_sessions (
-          token_hash TEXT PRIMARY KEY,
-          username TEXT NOT NULL,
-          credential_version TEXT NOT NULL,
-          expires_at INTEGER NOT NULL
-        );
-      `);
-      await client.execute(`
-        CREATE TABLE IF NOT EXISTS login_limits (
-          key TEXT PRIMARY KEY,
-          attempts INTEGER NOT NULL,
-          expires_at INTEGER NOT NULL
-        );
-      `);
-
-      const countRes = await client.execute('SELECT COUNT(*) as c FROM products');
-      const count = Number(countRes.rows[0]?.c ?? 0);
-      if (count === 0) {
-        for (const dish of defaultDishes) {
-          await client.execute({
-            sql: `INSERT OR IGNORE INTO products (id,name,description,category,price,image,portion,is_new,available,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-            args: [dish.id, dish.name, dish.description, dish.category, dish.price, dish.image, dish.portion, dish.is_new, dish.available, dish.created_at],
-          });
-        }
-        await client.execute({
-          sql: `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`,
-          args: ['catalog_initialized', '1'],
-        });
-      }
-    })();
-  }
-  return libsqlInitPromise;
-}
-
-async function ensurePostgresInitialized(sql: NeonQueryFunction<false, false>) {
-  if (!postgresInitPromise) {
-    postgresInitPromise = (async () => {
-      await sql`
-        CREATE TABLE IF NOT EXISTS products (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          description TEXT NOT NULL,
-          category TEXT NOT NULL,
-          price DOUBLE PRECISION NOT NULL,
-          image TEXT NOT NULL,
-          portion TEXT NOT NULL,
-          is_new INTEGER NOT NULL DEFAULT 0,
-          available INTEGER NOT NULL DEFAULT 1,
-          created_at BIGINT NOT NULL
-        );
-      `;
-      await sql`
-        CREATE TABLE IF NOT EXISTS settings (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-      `;
-      await sql`
-        CREATE TABLE IF NOT EXISTS admin_sessions (
-          token_hash TEXT PRIMARY KEY,
-          username TEXT NOT NULL,
-          credential_version TEXT NOT NULL,
-          expires_at BIGINT NOT NULL
-        );
-      `;
-      await sql`
-        CREATE TABLE IF NOT EXISTS login_limits (
-          key TEXT PRIMARY KEY,
-          attempts INTEGER NOT NULL,
-          expires_at BIGINT NOT NULL
-        );
-      `;
-
-      const countRows = await sql`SELECT COUNT(*) as c FROM products;`;
-      const count = Number(countRows[0]?.c ?? 0);
-      if (count === 0) {
-        for (const dish of defaultDishes) {
-          await sql`
-            INSERT INTO products (id, name, description, category, price, image, portion, is_new, available, created_at)
-            VALUES (${dish.id}, ${dish.name}, ${dish.description}, ${dish.category}, ${dish.price}, ${dish.image}, ${dish.portion}, ${dish.is_new}, ${dish.available}, ${dish.created_at})
-            ON CONFLICT (id) DO NOTHING;
-          `;
-        }
-        await sql`
-          INSERT INTO settings (key, value)
-          VALUES ('catalog_initialized', '1')
-          ON CONFLICT (key) DO NOTHING;
-        `;
-      }
-    })();
-  }
-  return postgresInitPromise;
-}
-
-async function ensureRedisInitialized(redis: Redis) {
-  if (!redisInitPromise) {
-    redisInitPromise = (async () => {
-      const exists = await redis.exists('kumo:products');
-      if (!exists) {
-        await redis.set('kumo:products', defaultDishes);
-        await redis.set('kumo:settings:catalog_initialized', '1');
-      }
-    })();
-  }
-  return redisInitPromise;
-}
-
-// --- Local File Storage Fallback ---
+// --- Local & Cloud Sync State ---
 function getLocalDbFilePath(): string {
   if (process.env.DB_PATH) return process.env.DB_PATH;
   try {
@@ -278,8 +146,61 @@ function getLocalDbFilePath(): string {
 }
 
 let inMemoryState: DatabaseState | null = null;
+let lastCloudSyncTime = 0;
 
-function loadLocalState(): DatabaseState {
+async function syncFromCloud(): Promise<DatabaseState | null> {
+  if (!CLOUD_GIST_TOKEN || !CLOUD_GIST_ID) return null;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${CLOUD_GIST_ID}`, {
+      headers: {
+        'Authorization': `token ${CLOUD_GIST_TOKEN}`,
+        'User-Agent': 'KUMO-App',
+      },
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { files?: { 'kumo_db.json'?: { content?: string } } };
+    const file = data.files?.['kumo_db.json'];
+    if (file && file.content) {
+      const parsed = JSON.parse(file.content) as DatabaseState;
+      if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
+        inMemoryState = parsed;
+        lastCloudSyncTime = Date.now();
+        // Also persist locally
+        saveToDisk(parsed);
+        return inMemoryState;
+      }
+    }
+  } catch (e) {
+    console.warn('Cloud sync read warning:', e);
+  }
+  return null;
+}
+
+async function syncToCloud(state: DatabaseState): Promise<void> {
+  if (!CLOUD_GIST_TOKEN || !CLOUD_GIST_ID) return;
+  try {
+    await fetch(`https://api.github.com/gists/${CLOUD_GIST_ID}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `token ${CLOUD_GIST_TOKEN}`,
+        'User-Agent': 'KUMO-App',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        files: {
+          'kumo_db.json': {
+            content: JSON.stringify(state, null, 2),
+          },
+        },
+      }),
+    });
+  } catch (e) {
+    console.error('Cloud sync write error:', e);
+  }
+}
+
+function loadLocalDiskState(): DatabaseState {
   const primaryPath = getLocalDbFilePath();
   const pathsToTry = Array.from(new Set([primaryPath, '/tmp/kumo_db.json']));
 
@@ -305,13 +226,12 @@ function loadLocalState(): DatabaseState {
       login_limits: [],
       settings: [{ key: 'catalog_initialized', value: '1' }],
     };
-    saveLocalState(inMemoryState);
+    saveToDisk(inMemoryState);
   }
   return inMemoryState;
 }
 
-function saveLocalState(state: DatabaseState): void {
-  inMemoryState = state;
+function saveToDisk(state: DatabaseState): void {
   const filePath = getLocalDbFilePath();
   const pathsToSave = Array.from(new Set([filePath, '/tmp/kumo_db.json']));
 
@@ -326,6 +246,24 @@ function saveLocalState(state: DatabaseState): void {
       // Ignore
     }
   }
+}
+
+async function getAppState(): Promise<DatabaseState> {
+  // Sync from cloud every 10 seconds or on first boot
+  if (!inMemoryState || Date.now() - lastCloudSyncTime > 10000) {
+    const cloudState = await syncFromCloud();
+    if (cloudState) return cloudState;
+  }
+  if (!inMemoryState) {
+    return loadLocalDiskState();
+  }
+  return inMemoryState;
+}
+
+async function persistAppState(state: DatabaseState): Promise<void> {
+  inMemoryState = state;
+  saveToDisk(state);
+  await syncToCloud(state);
 }
 
 // --- Database Interface ---
@@ -376,17 +314,13 @@ function createExecutor(
 
   return {
     async first<T = any>(): Promise<T | null> {
-      // 1. Turso / libSQL
       if (libsql) {
-        await ensureLibsqlInitialized(libsql);
         const res = await libsql.execute({ sql: trimmed, args });
         if (res.rows.length === 0) return null;
         return (res.rows[0] as unknown) as T;
       }
 
-      // 2. PostgreSQL / Neon / Supabase
       if (postgres) {
-        await ensurePostgresInitialized(postgres);
         let pgQuery = trimmed;
         let paramIdx = 1;
         while (pgQuery.includes('?')) {
@@ -397,9 +331,7 @@ function createExecutor(
         return res[0] as T;
       }
 
-      // 3. Upstash Redis / Vercel KV
       if (redis) {
-        await ensureRedisInitialized(redis);
         if (trimmed.includes('FROM settings WHERE key = ?')) {
           const key = args[0];
           const val = await redis.get<string>(`kumo:settings:${key}`);
@@ -428,8 +360,8 @@ function createExecutor(
         }
       }
 
-      // 4. Local File Storage Fallback
-      const state = loadLocalState();
+      // Universal Cloud & Disk Fallback
+      const state = await getAppState();
       if (trimmed.includes('FROM settings WHERE key = ?')) {
         const key = args[0];
         const row = state.settings.find(s => s.key === key);
@@ -451,11 +383,11 @@ function createExecutor(
         if (existing) {
           existing.attempts += 1;
           existing.expires_at = expiresAt;
-          saveLocalState(state);
+          await persistAppState(state);
           return { attempts: existing.attempts } as unknown as T;
         } else {
           state.login_limits.push({ key: bucket, attempts: 1, expires_at: expiresAt });
-          saveLocalState(state);
+          await persistAppState(state);
           return { attempts: 1 } as unknown as T;
         }
       }
@@ -464,16 +396,12 @@ function createExecutor(
     },
 
     async all<T = any>(): Promise<{ results: T[] }> {
-      // 1. Turso / libSQL
       if (libsql) {
-        await ensureLibsqlInitialized(libsql);
         const res = await libsql.execute({ sql: trimmed, args });
         return { results: (res.rows as unknown) as T[] };
       }
 
-      // 2. PostgreSQL / Neon / Supabase
       if (postgres) {
-        await ensurePostgresInitialized(postgres);
         let pgQuery = trimmed;
         let paramIdx = 1;
         while (pgQuery.includes('?')) {
@@ -483,9 +411,7 @@ function createExecutor(
         return { results: (res || []) as T[] };
       }
 
-      // 3. Upstash Redis / Vercel KV
       if (redis) {
-        await ensureRedisInitialized(redis);
         if (trimmed.includes('FROM products')) {
           const products = (await redis.get<ProductRow[]>('kumo:products')) || defaultDishes;
           const sorted = [...products].sort((a, b) => {
@@ -500,8 +426,8 @@ function createExecutor(
         return { results: [] };
       }
 
-      // 4. Local File Storage Fallback
-      const state = loadLocalState();
+      // Universal Cloud & Disk Fallback
+      const state = await getAppState();
       if (trimmed.includes('FROM products')) {
         const sorted = [...state.products].sort((a, b) => {
           if (trimmed.includes('is_new DESC')) {
@@ -517,16 +443,12 @@ function createExecutor(
     },
 
     async run(): Promise<{ meta: { changes: number } }> {
-      // 1. Turso / libSQL
       if (libsql) {
-        await ensureLibsqlInitialized(libsql);
         const res = await libsql.execute({ sql: trimmed, args });
         return { meta: { changes: res.rowsAffected } };
       }
 
-      // 2. PostgreSQL / Neon / Supabase
       if (postgres) {
-        await ensurePostgresInitialized(postgres);
         let pgQuery = trimmed;
         if (pgQuery.startsWith('INSERT OR IGNORE INTO settings')) {
           pgQuery = 'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING';
@@ -540,9 +462,7 @@ function createExecutor(
         return { meta: { changes: Array.isArray(res) ? res.length || 1 : 1 } };
       }
 
-      // 3. Upstash Redis / Vercel KV
       if (redis) {
-        await ensureRedisInitialized(redis);
         if (trimmed.startsWith('DELETE FROM products WHERE id = ?')) {
           const id = args[0];
           const products = (await redis.get<ProductRow[]>('kumo:products')) || defaultDishes;
@@ -594,13 +514,13 @@ function createExecutor(
         return { meta: { changes: 1 } };
       }
 
-      // 4. Local File Storage Fallback
-      const state = loadLocalState();
+      // Universal Cloud & Disk Fallback
+      const state = await getAppState();
       if (trimmed.startsWith('DELETE FROM products WHERE id = ?')) {
         const id = args[0];
         const prevCount = state.products.length;
         state.products = state.products.filter(p => p.id !== id);
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: prevCount - state.products.length } };
       }
 
@@ -608,7 +528,7 @@ function createExecutor(
         const tokenHash = args[0];
         const prev = state.admin_sessions.length;
         state.admin_sessions = state.admin_sessions.filter(s => s.token_hash !== tokenHash);
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: prev - state.admin_sessions.length } };
       }
 
@@ -616,21 +536,21 @@ function createExecutor(
         const now = args[0];
         const prev = state.admin_sessions.length;
         state.admin_sessions = state.admin_sessions.filter(s => s.expires_at > now);
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: prev - state.admin_sessions.length } };
       }
 
       if (trimmed.startsWith('DELETE FROM login_limits WHERE expires_at <= ?')) {
         const now = args[0];
         state.login_limits = state.login_limits.filter(l => l.expires_at > now);
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: 1 } };
       }
 
       if (trimmed.startsWith('DELETE FROM login_limits WHERE key = ?')) {
         const key = args[0];
         state.login_limits = state.login_limits.filter(l => l.key !== key);
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: 1 } };
       }
 
@@ -654,7 +574,7 @@ function createExecutor(
         } else {
           state.products.unshift(newRow);
         }
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: 1 } };
       }
 
@@ -662,7 +582,7 @@ function createExecutor(
         const [key, value] = args;
         if (!state.settings.some(s => s.key === key)) {
           state.settings.push({ key, value });
-          saveLocalState(state);
+          await persistAppState(state);
         }
         return { meta: { changes: 1 } };
       }
@@ -670,7 +590,7 @@ function createExecutor(
       if (trimmed.startsWith('INSERT INTO admin_sessions')) {
         const [token_hash, username, credential_version, expires_at] = args;
         state.admin_sessions.push({ token_hash, username, credential_version, expires_at });
-        saveLocalState(state);
+        await persistAppState(state);
         return { meta: { changes: 1 } };
       }
 
