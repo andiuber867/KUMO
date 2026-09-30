@@ -39,7 +39,41 @@ export function AdminPanel({username}:{username:string}){
    }
  }
  async function save(e:FormEvent){e.preventDefault();if(!editing||busy||uploading)return;setBusy(true);setFormError('');try{await api(editing.id?'/api/products/'+editing.id:'/api/products',editing.id?'PUT':'POST',editing);await load();notifyCatalog();setEditing(null);toast.success('Producto guardado en la carta.')}catch(e){setFormError((e as Error).message)}finally{setBusy(false)}}
- async function upload(file?:File){if(!file)return;setUploading(true);setFormError('');try{if(file.size>5*1024*1024)throw Error('La foto debe pesar menos de 5 MB.');const data=new FormData();data.set('file',file);const r=await fetch('/api/uploads',{method:'POST',body:data});const d=await r.json() as {error?:string;url:string};if(!r.ok)throw Error(d.error||'No se pudo subir la imagen.');setEditing(p=>p?{...p,image:d.url}:p)}catch(e){setFormError((e as Error).message)}finally{setUploading(false)}}
+ async function compressImage(file: File, maxWidth = 1200, quality = 0.85): Promise<File> {
+   return new Promise((resolve) => {
+     if (file.type === 'image/svg+xml' || file.size < 50 * 1024) return resolve(file);
+     const reader = new FileReader();
+     reader.onload = (e) => {
+       const img = new Image();
+       img.onload = () => {
+         let { width, height } = img;
+         if (width > maxWidth) {
+           height = Math.round((height * maxWidth) / width);
+           width = maxWidth;
+         }
+         const canvas = document.createElement('canvas');
+         canvas.width = width;
+         canvas.height = height;
+         const ctx = canvas.getContext('2d');
+         if (!ctx) return resolve(file);
+         ctx.drawImage(img, 0, 0, width, height);
+         canvas.toBlob(
+           (blob) => {
+             if (!blob || blob.size >= file.size) return resolve(file);
+             resolve(new File([blob], file.name.replace(/\.[^/.]+$/, '') + '.webp', { type: 'image/webp' }));
+           },
+           'image/webp',
+           quality
+         );
+       };
+       img.onerror = () => resolve(file);
+       img.src = e.target?.result as string;
+     };
+     reader.onerror = () => resolve(file);
+     reader.readAsDataURL(file);
+   });
+ }
+ async function upload(file?:File){if(!file)return;setUploading(true);setFormError('');try{const optimized=await compressImage(file);if(optimized.size>5*1024*1024)throw Error('La foto debe pesar menos de 5 MB.');const data=new FormData();data.set('file',optimized);const r=await fetch('/api/uploads',{method:'POST',body:data});const d=await r.json() as {error?:string;url:string};if(!r.ok)throw Error(d.error||'No se pudo subir la imagen.');setEditing(p=>p?{...p,image:d.url}:p)}catch(e){setFormError((e as Error).message)}finally{setUploading(false)}}
  async function remove(){if(!deleting)return;setBusy(true);try{await api('/api/products/'+deleting.id,'DELETE');await load();notifyCatalog();setDeleting(null);toast.success('Producto eliminado.')}catch(e){toast.error((e as Error).message)}finally{setBusy(false)}}
  async function showQR(){try{const url=window.location.origin+'/menu';setQrUrl(url);setQr(await QRCode.toDataURL(url,{width:1000,margin:4,color:{dark:'#121313',light:'#ffffff'}}));setQrOpen(true)}catch{toast.error('No se pudo generar el QR.')}}
 

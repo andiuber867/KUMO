@@ -1,5 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createClient as createLibsqlClient, Client as LibsqlClient } from '@libsql/client';
+import { Redis } from '@upstash/redis';
+import { neon, NeonQueryFunction } from '@neondatabase/serverless';
 
 export interface ProductRow {
   id: string;
@@ -32,14 +35,14 @@ export interface SettingRow {
   value: string;
 }
 
-interface DatabaseState {
+export interface DatabaseState {
   products: ProductRow[];
   admin_sessions: AdminSessionRow[];
   login_limits: LoginLimitRow[];
   settings: SettingRow[];
 }
 
-const defaultDishes: ProductRow[] = [
+export const defaultDishes: ProductRow[] = [
   {
     id: 'kumo-1',
     name: 'Kumo Signature Roll',
@@ -90,19 +93,172 @@ const defaultDishes: ProductRow[] = [
   },
 ];
 
-function getDbFilePath(): string {
-  if (process.env.DB_PATH) return process.env.DB_PATH;
-  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
-    return '/tmp/kumo_db.json';
+// --- Engine Detectors ---
+function getLibsqlClient(): LibsqlClient | null {
+  const url = process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL;
+  if (!url) return null;
+  const authToken = process.env.TURSO_AUTH_TOKEN || process.env.LIBSQL_AUTH_TOKEN;
+  return createLibsqlClient({ url, authToken });
+}
+
+function getPostgresClient(): NeonQueryFunction<false, false> | null {
+  const url = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
+  if (!url) return null;
+  return neon(url);
+}
+
+function getRedisClient(): Redis | null {
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  return new Redis({ url, token });
+}
+
+// --- Initialization Flags ---
+let libsqlInitPromise: Promise<void> | null = null;
+let postgresInitPromise: Promise<void> | null = null;
+let redisInitPromise: Promise<void> | null = null;
+
+async function ensureLibsqlInitialized(client: LibsqlClient) {
+  if (!libsqlInitPromise) {
+    libsqlInitPromise = (async () => {
+      await client.execute(`
+        CREATE TABLE IF NOT EXISTS products (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT NOT NULL,
+          category TEXT NOT NULL,
+          price REAL NOT NULL,
+          image TEXT NOT NULL,
+          portion TEXT NOT NULL,
+          is_new INTEGER NOT NULL DEFAULT 0,
+          available INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL
+        );
+      `);
+      await client.execute(`
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `);
+      await client.execute(`
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          token_hash TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          credential_version TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+      `);
+      await client.execute(`
+        CREATE TABLE IF NOT EXISTS login_limits (
+          key TEXT PRIMARY KEY,
+          attempts INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+      `);
+
+      // Seed if empty
+      const countRes = await client.execute('SELECT COUNT(*) as c FROM products');
+      const count = Number(countRes.rows[0]?.c ?? 0);
+      if (count === 0) {
+        for (const dish of defaultDishes) {
+          await client.execute({
+            sql: `INSERT OR IGNORE INTO products (id,name,description,category,price,image,portion,is_new,available,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            args: [dish.id, dish.name, dish.description, dish.category, dish.price, dish.image, dish.portion, dish.is_new, dish.available, dish.created_at],
+          });
+        }
+        await client.execute({
+          sql: `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`,
+          args: ['catalog_initialized', '1'],
+        });
+      }
+    })();
   }
+  return libsqlInitPromise;
+}
+
+async function ensurePostgresInitialized(sql: NeonQueryFunction<false, false>) {
+  if (!postgresInitPromise) {
+    postgresInitPromise = (async () => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS products (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT NOT NULL,
+          category TEXT NOT NULL,
+          price DOUBLE PRECISION NOT NULL,
+          image TEXT NOT NULL,
+          portion TEXT NOT NULL,
+          is_new INTEGER NOT NULL DEFAULT 0,
+          available INTEGER NOT NULL DEFAULT 1,
+          created_at BIGINT NOT NULL
+        );
+      `;
+      await sql`
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `;
+      await sql`
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          token_hash TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          credential_version TEXT NOT NULL,
+          expires_at BIGINT NOT NULL
+        );
+      `;
+      await sql`
+        CREATE TABLE IF NOT EXISTS login_limits (
+          key TEXT PRIMARY KEY,
+          attempts INTEGER NOT NULL,
+          expires_at BIGINT NOT NULL
+        );
+      `;
+
+      const countRows = await sql`SELECT COUNT(*) as c FROM products;`;
+      const count = Number(countRows[0]?.c ?? 0);
+      if (count === 0) {
+        for (const dish of defaultDishes) {
+          await sql`
+            INSERT INTO products (id, name, description, category, price, image, portion, is_new, available, created_at)
+            VALUES (${dish.id}, ${dish.name}, ${dish.description}, ${dish.category}, ${dish.price}, ${dish.image}, ${dish.portion}, ${dish.is_new}, ${dish.available}, ${dish.created_at})
+            ON CONFLICT (id) DO NOTHING;
+          `;
+        }
+        await sql`
+          INSERT INTO settings (key, value)
+          VALUES ('catalog_initialized', '1')
+          ON CONFLICT (key) DO NOTHING;
+        `;
+      }
+    })();
+  }
+  return postgresInitPromise;
+}
+
+async function ensureRedisInitialized(redis: Redis) {
+  if (!redisInitPromise) {
+    redisInitPromise = (async () => {
+      const exists = await redis.exists('kumo:products');
+      if (!exists) {
+        await redis.set('kumo:products', defaultDishes);
+        await redis.set('kumo:settings:catalog_initialized', '1');
+      }
+    })();
+  }
+  return redisInitPromise;
+}
+
+// --- Local File Storage Fallback ---
+function getLocalDbFilePath(): string {
+  if (process.env.DB_PATH) return process.env.DB_PATH;
   try {
     const dataDir = path.join(process.cwd(), '.data');
-    if (!fs.existsSync(/*turbopackIgnore: true*/ dataDir)) {
-      fs.mkdirSync(/*turbopackIgnore: true*/ dataDir, { recursive: true });
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
     }
-    const testFile = path.join(dataDir, '.write_test');
-    fs.writeFileSync(/*turbopackIgnore: true*/ testFile, '1');
-    fs.unlinkSync(/*turbopackIgnore: true*/ testFile);
     return path.join(dataDir, 'kumo_db.json');
   } catch {
     return '/tmp/kumo_db.json';
@@ -111,14 +267,14 @@ function getDbFilePath(): string {
 
 let inMemoryState: DatabaseState | null = null;
 
-function loadState(): DatabaseState {
-  const primaryPath = getDbFilePath();
+function loadLocalState(): DatabaseState {
+  const primaryPath = getLocalDbFilePath();
   const pathsToTry = Array.from(new Set([primaryPath, '/tmp/kumo_db.json']));
 
   for (const filePath of pathsToTry) {
     try {
-      if (fs.existsSync(/*turbopackIgnore: true*/ filePath)) {
-        const content = fs.readFileSync(/*turbopackIgnore: true*/ filePath, 'utf8');
+      if (fs.existsSync(filePath)) {
+        const content = fs.readFileSync(filePath, 'utf8');
         const parsed = JSON.parse(content) as DatabaseState;
         if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
           inMemoryState = parsed;
@@ -126,7 +282,7 @@ function loadState(): DatabaseState {
         }
       }
     } catch {
-      // Continue trying fallback paths
+      // Continue
     }
   }
 
@@ -137,64 +293,157 @@ function loadState(): DatabaseState {
       login_limits: [],
       settings: [{ key: 'catalog_initialized', value: '1' }],
     };
-    saveState(inMemoryState);
+    saveLocalState(inMemoryState);
   }
   return inMemoryState;
 }
 
-function saveState(state: DatabaseState): void {
+function saveLocalState(state: DatabaseState): void {
   inMemoryState = state;
-  const filePath = getDbFilePath();
+  const filePath = getLocalDbFilePath();
   const pathsToSave = Array.from(new Set([filePath, '/tmp/kumo_db.json']));
 
   for (const fp of pathsToSave) {
     try {
       const dir = path.dirname(fp);
-      if (!fs.existsSync(/*turbopackIgnore: true*/ dir)) {
-        fs.mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(/*turbopackIgnore: true*/ fp, JSON.stringify(state, null, 2), 'utf8');
+      fs.writeFileSync(fp, JSON.stringify(state, null, 2), 'utf8');
     } catch {
-      // Ignore errors on non-writable paths
+      // Ignore
     }
   }
 }
 
-function createStatementExecutor(sql: string, args: any[] = []) {
+// --- Database Interface ---
+export function database() {
+  const libsql = getLibsqlClient();
+  const postgres = !libsql ? getPostgresClient() : null;
+  const redis = !libsql && !postgres ? getRedisClient() : null;
+
+  return {
+    prepare(sqlQuery: string) {
+      return {
+        bind(...args: any[]) {
+          return createExecutor(sqlQuery, args, { libsql, postgres, redis });
+        },
+        first<T = any>() {
+          return createExecutor(sqlQuery, [], { libsql, postgres, redis }).first<T>();
+        },
+        all<T = any>() {
+          return createExecutor(sqlQuery, [], { libsql, postgres, redis }).all<T>();
+        },
+        run() {
+          return createExecutor(sqlQuery, [], { libsql, postgres, redis }).run();
+        },
+      };
+    },
+
+    async batch(statements: any[]) {
+      const results = [];
+      for (const stmt of statements) {
+        results.push(await stmt.run());
+      }
+      return results;
+    },
+  };
+}
+
+function createExecutor(
+  sqlQuery: string,
+  args: any[],
+  clients: {
+    libsql: LibsqlClient | null;
+    postgres: NeonQueryFunction<false, false> | null;
+    redis: Redis | null;
+  }
+) {
+  const { libsql, postgres, redis } = clients;
+  const trimmed = sqlQuery.trim();
+
   return {
     async first<T = any>(): Promise<T | null> {
-      const state = loadState();
-      const trimmed = sql.trim();
+      // 1. Turso / libSQL
+      if (libsql) {
+        await ensureLibsqlInitialized(libsql);
+        const res = await libsql.execute({ sql: trimmed, args });
+        if (res.rows.length === 0) return null;
+        return (res.rows[0] as unknown) as T;
+      }
 
+      // 2. PostgreSQL / Neon / Supabase
+      if (postgres) {
+        await ensurePostgresInitialized(postgres);
+        let pgQuery = trimmed;
+        let paramIdx = 1;
+        while (pgQuery.includes('?')) {
+          pgQuery = pgQuery.replace('?', `$${paramIdx++}`);
+        }
+        const res = await (postgres as any)(pgQuery, args);
+        if (!res || res.length === 0) return null;
+        return res[0] as T;
+      }
+
+      // 3. Upstash Redis / Vercel KV
+      if (redis) {
+        await ensureRedisInitialized(redis);
+        if (trimmed.includes('FROM settings WHERE key = ?')) {
+          const key = args[0];
+          const val = await redis.get<string>(`kumo:settings:${key}`);
+          return (val !== null ? { key, value: val } : null) as unknown as T;
+        }
+        if (trimmed.includes('FROM products WHERE id = ?')) {
+          const id = args[0];
+          const products = (await redis.get<ProductRow[]>('kumo:products')) || defaultDishes;
+          const found = products.find(p => p.id === id);
+          return (found ? { id: found.id } : null) as unknown as T;
+        }
+        if (trimmed.includes('FROM admin_sessions WHERE token_hash = ? AND expires_at > ?')) {
+          const [tokenHash, now] = args;
+          const session = await redis.get<AdminSessionRow>(`kumo:session:${tokenHash}`);
+          if (session && session.expires_at > now) {
+            return { username: session.username, credential_version: session.credential_version } as unknown as T;
+          }
+          return null;
+        }
+        if (trimmed.includes('login_limits') && trimmed.includes('attempts')) {
+          const [bucket, expiresAt] = args;
+          const key = `kumo:login_limit:${bucket}`;
+          const current = await redis.incr(key);
+          await redis.expire(key, Math.max(1, Math.floor((expiresAt - Date.now()) / 1000)));
+          return { attempts: current } as unknown as T;
+        }
+      }
+
+      // 4. Local File Storage Fallback
+      const state = loadLocalState();
       if (trimmed.includes('FROM settings WHERE key = ?')) {
         const key = args[0];
         const row = state.settings.find(s => s.key === key);
         return (row as unknown as T) || null;
       }
-
       if (trimmed.includes('FROM products WHERE id = ?')) {
         const id = args[0];
         const row = state.products.find(p => p.id === id);
         return (row ? { id: row.id } : null) as unknown as T;
       }
-
       if (trimmed.includes('FROM admin_sessions WHERE token_hash = ? AND expires_at > ?')) {
         const [tokenHash, now] = args;
         const row = state.admin_sessions.find(s => s.token_hash === tokenHash && s.expires_at > now);
         return (row ? { username: row.username, credential_version: row.credential_version } : null) as unknown as T;
       }
-
       if (trimmed.includes('login_limits') && trimmed.includes('attempts')) {
         const [bucket, expiresAt] = args;
         const existing = state.login_limits.find(l => l.key === bucket);
         if (existing) {
           existing.attempts += 1;
           existing.expires_at = expiresAt;
-          saveState(state);
+          saveLocalState(state);
           return { attempts: existing.attempts } as unknown as T;
         } else {
           state.login_limits.push({ key: bucket, attempts: 1, expires_at: expiresAt });
-          saveState(state);
+          saveLocalState(state);
           return { attempts: 1 } as unknown as T;
         }
       }
@@ -203,9 +452,44 @@ function createStatementExecutor(sql: string, args: any[] = []) {
     },
 
     async all<T = any>(): Promise<{ results: T[] }> {
-      const state = loadState();
-      const trimmed = sql.trim();
+      // 1. Turso / libSQL
+      if (libsql) {
+        await ensureLibsqlInitialized(libsql);
+        const res = await libsql.execute({ sql: trimmed, args });
+        return { results: (res.rows as unknown) as T[] };
+      }
 
+      // 2. PostgreSQL / Neon / Supabase
+      if (postgres) {
+        await ensurePostgresInitialized(postgres);
+        let pgQuery = trimmed;
+        let paramIdx = 1;
+        while (pgQuery.includes('?')) {
+          pgQuery = pgQuery.replace('?', `$${paramIdx++}`);
+        }
+        const res = await (postgres as any)(pgQuery, args);
+        return { results: (res || []) as T[] };
+      }
+
+      // 3. Upstash Redis / Vercel KV
+      if (redis) {
+        await ensureRedisInitialized(redis);
+        if (trimmed.includes('FROM products')) {
+          const products = (await redis.get<ProductRow[]>('kumo:products')) || defaultDishes;
+          const sorted = [...products].sort((a, b) => {
+            if (trimmed.includes('is_new DESC')) {
+              if (b.is_new !== a.is_new) return b.is_new - a.is_new;
+            }
+            if (b.created_at !== a.created_at) return b.created_at - a.created_at;
+            return a.name.localeCompare(b.name);
+          });
+          return { results: sorted as unknown as T[] };
+        }
+        return { results: [] };
+      }
+
+      // 4. Local File Storage Fallback
+      const state = loadLocalState();
       if (trimmed.includes('FROM products')) {
         const sorted = [...state.products].sort((a, b) => {
           if (trimmed.includes('is_new DESC')) {
@@ -217,19 +501,95 @@ function createStatementExecutor(sql: string, args: any[] = []) {
         return { results: sorted as unknown as T[] };
       }
 
-
       return { results: [] };
     },
 
     async run(): Promise<{ meta: { changes: number } }> {
-      const state = loadState();
-      const trimmed = sql.trim();
+      // 1. Turso / libSQL
+      if (libsql) {
+        await ensureLibsqlInitialized(libsql);
+        const res = await libsql.execute({ sql: trimmed, args });
+        return { meta: { changes: res.rowsAffected } };
+      }
 
+      // 2. PostgreSQL / Neon / Supabase
+      if (postgres) {
+        await ensurePostgresInitialized(postgres);
+        let pgQuery = trimmed;
+        // Transform SQLite specific syntax to Postgres if needed
+        if (pgQuery.startsWith('INSERT OR IGNORE INTO settings')) {
+          pgQuery = 'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING';
+        } else {
+          let paramIdx = 1;
+          while (pgQuery.includes('?')) {
+            pgQuery = pgQuery.replace('?', `$${paramIdx++}`);
+          }
+        }
+        const res = await (postgres as any)(pgQuery, args);
+        return { meta: { changes: Array.isArray(res) ? res.length || 1 : 1 } };
+      }
+
+      // 3. Upstash Redis / Vercel KV
+      if (redis) {
+        await ensureRedisInitialized(redis);
+        if (trimmed.startsWith('DELETE FROM products WHERE id = ?')) {
+          const id = args[0];
+          const products = (await redis.get<ProductRow[]>('kumo:products')) || defaultDishes;
+          const filtered = products.filter(p => p.id !== id);
+          await redis.set('kumo:products', filtered);
+          return { meta: { changes: products.length - filtered.length } };
+        }
+        if (trimmed.startsWith('INSERT INTO products')) {
+          const [id, name, description, category, price, image, portion, is_new, available, created_at] = args;
+          const products = (await redis.get<ProductRow[]>('kumo:products')) || defaultDishes;
+          const idx = products.findIndex(p => p.id === id);
+          const newRow: ProductRow = {
+            id,
+            name,
+            description,
+            category,
+            price: Number(price),
+            image: image || '/images/sushi.jpg',
+            portion: portion || '',
+            is_new: Number(is_new),
+            available: Number(available),
+            created_at: Number(created_at) || Date.now(),
+          };
+          if (idx >= 0) {
+            products[idx] = newRow;
+          } else {
+            products.unshift(newRow);
+          }
+          await redis.set('kumo:products', products);
+          await redis.set('kumo:settings:catalog_initialized', '1');
+          return { meta: { changes: 1 } };
+        }
+        if (trimmed.startsWith('INSERT OR IGNORE INTO settings')) {
+          const [key, value] = args;
+          await redis.set(`kumo:settings:${key}`, value);
+          return { meta: { changes: 1 } };
+        }
+        if (trimmed.startsWith('INSERT INTO admin_sessions')) {
+          const [token_hash, username, credential_version, expires_at] = args;
+          const ttlSeconds = Math.max(1, Math.floor((expires_at - Date.now()) / 1000));
+          await redis.set(`kumo:session:${token_hash}`, { token_hash, username, credential_version, expires_at }, { ex: ttlSeconds });
+          return { meta: { changes: 1 } };
+        }
+        if (trimmed.startsWith('DELETE FROM admin_sessions WHERE token_hash = ?')) {
+          const tokenHash = args[0];
+          await redis.del(`kumo:session:${tokenHash}`);
+          return { meta: { changes: 1 } };
+        }
+        return { meta: { changes: 1 } };
+      }
+
+      // 4. Local File Storage Fallback
+      const state = loadLocalState();
       if (trimmed.startsWith('DELETE FROM products WHERE id = ?')) {
         const id = args[0];
         const prevCount = state.products.length;
         state.products = state.products.filter(p => p.id !== id);
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: prevCount - state.products.length } };
       }
 
@@ -237,7 +597,7 @@ function createStatementExecutor(sql: string, args: any[] = []) {
         const tokenHash = args[0];
         const prev = state.admin_sessions.length;
         state.admin_sessions = state.admin_sessions.filter(s => s.token_hash !== tokenHash);
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: prev - state.admin_sessions.length } };
       }
 
@@ -245,21 +605,21 @@ function createStatementExecutor(sql: string, args: any[] = []) {
         const now = args[0];
         const prev = state.admin_sessions.length;
         state.admin_sessions = state.admin_sessions.filter(s => s.expires_at > now);
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: prev - state.admin_sessions.length } };
       }
 
       if (trimmed.startsWith('DELETE FROM login_limits WHERE expires_at <= ?')) {
         const now = args[0];
         state.login_limits = state.login_limits.filter(l => l.expires_at > now);
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: 1 } };
       }
 
       if (trimmed.startsWith('DELETE FROM login_limits WHERE key = ?')) {
         const key = args[0];
         state.login_limits = state.login_limits.filter(l => l.key !== key);
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: 1 } };
       }
 
@@ -283,7 +643,7 @@ function createStatementExecutor(sql: string, args: any[] = []) {
         } else {
           state.products.unshift(newRow);
         }
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: 1 } };
       }
 
@@ -291,7 +651,7 @@ function createStatementExecutor(sql: string, args: any[] = []) {
         const [key, value] = args;
         if (!state.settings.some(s => s.key === key)) {
           state.settings.push({ key, value });
-          saveState(state);
+          saveLocalState(state);
         }
         return { meta: { changes: 1 } };
       }
@@ -299,40 +659,11 @@ function createStatementExecutor(sql: string, args: any[] = []) {
       if (trimmed.startsWith('INSERT INTO admin_sessions')) {
         const [token_hash, username, credential_version, expires_at] = args;
         state.admin_sessions.push({ token_hash, username, credential_version, expires_at });
-        saveState(state);
+        saveLocalState(state);
         return { meta: { changes: 1 } };
       }
 
       return { meta: { changes: 0 } };
-    },
-  };
-}
-
-export function database() {
-  return {
-    prepare(sql: string) {
-      return {
-        bind(...args: any[]) {
-          return createStatementExecutor(sql, args);
-        },
-        first<T = any>() {
-          return createStatementExecutor(sql, []).first<T>();
-        },
-        all<T = any>() {
-          return createStatementExecutor(sql, []).all<T>();
-        },
-        run() {
-          return createStatementExecutor(sql, []).run();
-        },
-      };
-    },
-
-    async batch(statements: any[]) {
-      const results = [];
-      for (const stmt of statements) {
-        results.push(await stmt.run());
-      }
-      return results;
     },
   };
 }
