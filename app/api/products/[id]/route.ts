@@ -2,20 +2,48 @@ import { saveProduct } from '@/features/products/repository';
 import { productInput } from '@/features/products/validation';
 import { authorizeMutation } from '@/lib/server/auth';
 import { database } from '@/lib/server/database';
-export async function PUT(request:Request,{params}:{params:Promise<{id:string}>}){
-  if(!await authorizeMutation(request))return Response.json({error:'Acceso no autorizado.'},{status:403});
-  try{
-    const parsed=productInput.safeParse(await request.json());
-    if(!parsed.success){
+
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+export const fetchCache = 'force-no-store';
+
+export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  if (!await authorizeMutation(request)) return Response.json({ error: 'Acceso no autorizado.' }, { status: 403 });
+  try {
+    const parsed = productInput.safeParse(await request.json());
+    if (!parsed.success) {
       const msg = parsed.error.issues[0]?.message || 'Revisa los datos del producto.';
-      return Response.json({error: msg},{status:400});
+      return Response.json({ error: msg }, { status: 400 });
     }
-    const {id}=await params;
-    const saved=await saveProduct(id,parsed.data,false);
-    return Response.json(saved?{ok:true}:{error:'El producto ya no existe.'},{status:saved?200:404});
-  }catch(e){
-    console.error('product update',e);
-    return Response.json({error:'No se pudo guardar. Vuelve a intentarlo.'},{status:503});
+    const { id } = await params;
+    const saved = await saveProduct(id, parsed.data, false);
+    return Response.json(
+      saved ? { ok: true } : { error: 'El producto ya no existe.' },
+      {
+        status: saved ? 200 : 404,
+        headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+      }
+    );
+  } catch (e) {
+    console.error('product update', e);
+    return Response.json({ error: 'No se pudo guardar. Vuelve a intentarlo.' }, { status: 503 });
   }
 }
-export async function DELETE(request:Request,{params}:{params:Promise<{id:string}>}){if(!await authorizeMutation(request))return Response.json({error:'Acceso no autorizado.'},{status:403});try{const {id}=await params;const result=await database().prepare('DELETE FROM products WHERE id = ?').bind(id).run();return Response.json({ok:result.meta.changes>0},{status:result.meta.changes?200:404})}catch(e){console.error('product delete',e);return Response.json({error:'No se pudo eliminar.'},{status:503})}}
+
+export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  if (!await authorizeMutation(request)) return Response.json({ error: 'Acceso no autorizado.' }, { status: 403 });
+  try {
+    const { id } = await params;
+    const result = await database().prepare('DELETE FROM products WHERE id = ?').bind(id).run();
+    return Response.json(
+      { ok: result.meta.changes > 0 },
+      {
+        status: result.meta.changes ? 200 : 404,
+        headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+      }
+    );
+  } catch (e) {
+    console.error('product delete', e);
+    return Response.json({ error: 'No se pudo eliminar.' }, { status: 503 });
+  }
+}

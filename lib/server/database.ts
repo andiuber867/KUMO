@@ -93,6 +93,13 @@ export const defaultDishes: ProductRow[] = [
   },
 ];
 
+export function getActiveEngine(): string {
+  if (process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL) return 'Turso (libSQL)';
+  if (process.env.POSTGRES_URL || process.env.DATABASE_URL || process.env.POSTGRES_PRISMA_URL) return 'PostgreSQL';
+  if (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || process.env.STORAGE_KV_REST_API_URL) return 'Upstash Redis / KV';
+  return 'Local';
+}
+
 // --- Engine Detectors ---
 function getLibsqlClient(): LibsqlClient | null {
   const url = process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL;
@@ -102,16 +109,22 @@ function getLibsqlClient(): LibsqlClient | null {
 }
 
 function getPostgresClient(): NeonQueryFunction<false, false> | null {
-  const url = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
+  const url = process.env.POSTGRES_URL || process.env.DATABASE_URL || process.env.POSTGRES_PRISMA_URL || process.env.POSTGRES_URL_NON_POOLING;
   if (!url) return null;
   return neon(url);
 }
 
 function getRedisClient(): Redis | null {
-  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
-  return new Redis({ url, token });
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || process.env.STORAGE_KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || process.env.STORAGE_KV_REST_API_TOKEN;
+  if (url && token) {
+    return new Redis({ url, token });
+  }
+  try {
+    return Redis.fromEnv();
+  } catch {
+    return null;
+  }
 }
 
 // --- Initialization Flags ---
@@ -158,7 +171,6 @@ async function ensureLibsqlInitialized(client: LibsqlClient) {
         );
       `);
 
-      // Seed if empty
       const countRes = await client.execute('SELECT COUNT(*) as c FROM products');
       const count = Number(countRes.rows[0]?.c ?? 0);
       if (count === 0) {
@@ -516,7 +528,6 @@ function createExecutor(
       if (postgres) {
         await ensurePostgresInitialized(postgres);
         let pgQuery = trimmed;
-        // Transform SQLite specific syntax to Postgres if needed
         if (pgQuery.startsWith('INSERT OR IGNORE INTO settings')) {
           pgQuery = 'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING';
         } else {
